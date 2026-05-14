@@ -1,5 +1,6 @@
 from flashrag.evaluator import Evaluator
 from flashrag.dataset.utils import split_dataset, merge_dataset
+from flashrag.monitor_hook import query_context
 from flashrag.utils import get_retriever, get_generator, get_refiner, get_judger
 from flashrag.prompt import PromptTemplate
 
@@ -81,7 +82,13 @@ class SequentialPipeline(BasicPipeline):
 
     def run(self, dataset, do_eval=True, pred_process_fun=None):
         input_query = dataset.question
-        retrieval_results = self.retriever.batch_search(input_query)
+        # rag-stack monitor: push query-id context so the lower layers
+        # (retriever / reranker / vectordb / generator) attribute their
+        # events to the right items. Recording itself happens at the
+        # call sites, not here.
+        _qids = [str(item.id) for item in dataset]
+        with query_context(_qids, step_idx=0):
+            retrieval_results = self.retriever.batch_search(input_query)
         dataset.update_output("retrieval_result", retrieval_results)
 
         if self.refiner:
@@ -122,7 +129,8 @@ class SequentialPipeline(BasicPipeline):
         # delete used refiner to release memory
         if self.refiner:
             del self.refiner
-        pred_answer_list = self.generator.generate(input_prompts)
+        with query_context(_qids, step_idx=0):
+            pred_answer_list = self.generator.generate(input_prompts)
         dataset.update_output("pred", pred_answer_list)
 
         dataset = self.evaluate(dataset, do_eval=do_eval, pred_process_fun=pred_process_fun)

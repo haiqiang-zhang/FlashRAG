@@ -6,6 +6,7 @@ import json
 import numpy as np
 import copy
 # from transformers import AutoTokenizer, PreTrainedTokenizer, PreTrainedTokenizerFast
+from flashrag.monitor_hook import query_context
 from flashrag.utils import get_retriever, get_generator, selfask_pred_parse, ircot_pred_parse
 from flashrag.pipeline import BasicPipeline
 from flashrag.pipeline.ReaRAG_utils import AgentUtils
@@ -108,7 +109,9 @@ class ReasoningPipeline(BasicPipeline):
                     item.finish_reason = 'Reach max retrieval number'
                 break
 
-            step_outputs = self.generator.generate(exist_prompts, stop=self.stop_tokens)
+            # rag-stack monitor: push attribution context for this batch.
+            with query_context([str(item.id) for item in exist_items], step_idx=current_step_idx):
+                step_outputs = self.generator.generate(exist_prompts, stop=self.stop_tokens)
             step_query_list = [] # store generated queries for retrieval
 
             # parse each sample's step output
@@ -118,7 +121,7 @@ class ReasoningPipeline(BasicPipeline):
                     item.pred = str(extract_between(step_output, self.begin_of_answer_token, self.end_of_answer_token))
                     item.finish_flag = True
                     item.finish_reason = "Finished"
-                
+
                 elif self.begin_of_query_token in step_output and step_output.endswith(self.end_of_query_token):
                     query = extract_between(step_output, self.begin_of_query_token, self.end_of_query_token)
                     if query is not None:
@@ -132,10 +135,15 @@ class ReasoningPipeline(BasicPipeline):
                     item.pred = step_output.strip()
                     item.finish_flag = True
                     item.finish_reason = 'Normal finish without answer pattern'
-                
+
             # do retrieval and add retrieved docs to prompt
             if len(step_query_list) > 0:
-                retrieved_docs = self.retriever.batch_search([it['query'] for it in step_query_list])
+                # rag-stack monitor: subset of active items that triggered retrieval.
+                with query_context(
+                    [str(it['item'].id) for it in step_query_list],
+                    step_idx=current_step_idx,
+                ):
+                    retrieved_docs = self.retriever.batch_search([it['query'] for it in step_query_list])
                 for it, item_retrieved_docs in zip(step_query_list, retrieved_docs):
                     item = it['item']
                     query = it['query']
@@ -777,17 +785,21 @@ Only give me the short answer and do not output any other words. For yes, or no 
         for now_iter_num in range(self.max_iter_num):
             # 先对于每个question，生成一个subquery
             now_items = [item for item in dataset if item.finish_flag == False]
+            now_qids = [str(item.id) for item in now_items]
             subquery_messages =  [get_generate_subquery_message(item.question, item.sub_queries, item.sub_answers, self.task_desc) for item in now_items]
 
             # 先使用generator生成subquery
             for item, subquery_message in zip(now_items, subquery_messages):
                 item.subquery_messages.append(subquery_message)
                 item.subquery_prompts.append(self.prompt_template.get_string(messages=item.subquery_messages[-1]))
-            subquery_responses = self.generator.generate([item.subquery_prompts[-1] for item in now_items],**self.generate_subquery_params)
+            # rag-stack monitor: each iter has 3 generate + 1 retrieve; tag step_idx with iter index.
+            with query_context(now_qids, step_idx=now_iter_num):
+                subquery_responses = self.generator.generate([item.subquery_prompts[-1] for item in now_items],**self.generate_subquery_params)
             for item, subquery_response in zip(now_items, subquery_responses):
                 item.sub_queries.append(self._normalize_subquery(subquery_response))
 
-            temp_retrieval_results = self.retriever.batch_search([item.sub_queries[-1] for item in now_items])
+            with query_context(now_qids, step_idx=now_iter_num):
+                temp_retrieval_results = self.retriever.batch_search([item.sub_queries[-1] for item in now_items])
 
             for item, temp_retrieval_result in zip(now_items, temp_retrieval_results):
                 item.sub_retrieval_results[now_iter_num] = temp_retrieval_result
@@ -798,8 +810,9 @@ Only give me the short answer and do not output any other words. For yes, or no 
             for item, intermediate_answer_message, intermediate_answer_prompt in zip(now_items, intermediate_answer_messages, intermediate_answer_prompts):
                 item.intermediate_answer_messages.append(intermediate_answer_message)
                 item.intermediate_answer_prompts.append(intermediate_answer_prompt)
-            
-            intermediate_answer_responses = self.generator.generate(intermediate_answer_prompts,**self.generate_intermediate_answer_params)
+
+            with query_context(now_qids, step_idx=now_iter_num):
+                intermediate_answer_responses = self.generator.generate(intermediate_answer_prompts,**self.generate_intermediate_answer_params)
             for item, intermediate_answer_response in zip(now_items, intermediate_answer_responses):
                 item.sub_answers.append(intermediate_answer_response)
 
@@ -807,7 +820,11 @@ Only give me the short answer and do not output any other words. For yes, or no 
         final_answer_messages = [get_generate_final_answer_message(item.question, item.sub_queries, item.sub_answers,self.task_desc,sum(list(item.sub_retrieval_results.values()),[])) for item in dataset]
         final_answer_prompts = [self.prompt_template.get_string(messages=final_answer_message) for final_answer_message in final_answer_messages]
 
-        final_answer_responses = self.generator.generate(final_answer_prompts,**self.generate_final_answer_params)
+        # rag-stack monitor: final-answer step uses step_idx = max_iter_num (post-loop).
+        with query_context(
+            [str(item.id) for item in dataset], step_idx=self.max_iter_num,
+        ):
+            final_answer_responses = self.generator.generate(final_answer_prompts,**self.generate_final_answer_params)
         dataset.update_output('pred',final_answer_responses)
 
 

@@ -1,13 +1,17 @@
-import os
-from typing import List, Union
-from copy import deepcopy
-import warnings
-from tqdm import tqdm
-import numpy as np
-import threading
 import asyncio
-from openai import AsyncOpenAI, AsyncAzureOpenAI
+import os
+import threading
+import time
+from copy import deepcopy
+from typing import List, Union
+import warnings
+
+import numpy as np
 import tiktoken
+from openai import AsyncOpenAI, AsyncAzureOpenAI
+from tqdm import tqdm
+
+from flashrag.monitor_hook import get_monitor, record_generate_call
 
 _background_loop = None
 
@@ -145,9 +149,26 @@ class OpenaiGenerator:
 
     # ----------------- 同步包装接口 -----------------
     def generate(self, input_list: List, batch_size=None, return_scores=False, **params) -> List[str]:
+        # rag-stack monitor: time + record after the async future resolves.
+        _t0 = time.monotonic() if get_monitor() is not None else None
         loop = get_background_loop()
         future = asyncio.run_coroutine_threadsafe(
             self._generate_async(input_list, batch_size=batch_size, return_scores=return_scores, **params),
             loop
         )
-        return future.result()
+        result = future.result()
+        if _t0 is not None:
+            # ``result`` is either a list[str] (return_scores=False) or
+            # (list[str], list[float]) tuple — extract the texts for record.
+            if return_scores and isinstance(result, tuple) and len(result) == 2:
+                outputs_for_record = list(result[0])
+            else:
+                outputs_for_record = list(result) if not isinstance(result, str) else [result]
+            record_generate_call(
+                self,
+                input_list if isinstance(input_list, list) else [input_list],
+                outputs_for_record,
+                (time.monotonic() - _t0) * 1000.0,
+                framework="openai",
+            )
+        return result

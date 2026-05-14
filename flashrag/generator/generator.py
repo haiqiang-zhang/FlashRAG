@@ -1,3 +1,4 @@
+import time
 from typing import List
 from copy import deepcopy
 import warnings
@@ -12,6 +13,7 @@ from transformers import (
     AutoConfig,
 )
 from flashrag.generator.utils import resolve_max_tokens
+from flashrag.monitor_hook import get_monitor, record_generate_call
 from flashrag.utils import get_device
 
 
@@ -102,6 +104,9 @@ class EncoderDecoderGenerator(BaseGenerator):
         return passage_ids, passage_masks.bool()
 
     def generate(self, input_list: List, batch_size=None, **params):
+        # rag-stack monitor: time the whole batch + record after the work.
+        _t0 = time.monotonic() if get_monitor() is not None else None
+
         if isinstance(input_list, str):
             input_list = [input_list]
         if batch_size is None:
@@ -166,6 +171,11 @@ class EncoderDecoderGenerator(BaseGenerator):
 
             responses += outputs
 
+        if _t0 is not None:
+            record_generate_call(
+                self, input_list, responses, (time.monotonic() - _t0) * 1000.0,
+                framework="hf-encoder-decoder",
+            )
         return responses
 
 
@@ -220,6 +230,9 @@ class VLLMGenerator(BaseGenerator):
     ):
         from vllm import SamplingParams
 
+        # rag-stack monitor: time the whole batch + record after the work.
+        _t0 = time.monotonic() if get_monitor() is not None else None
+
         if isinstance(input_list, str):
             input_list = [input_list]
 
@@ -258,20 +271,56 @@ class VLLMGenerator(BaseGenerator):
         else:
             outputs = self.model.generate(input_list, sampling_params)
 
+        generated_texts = [
+            [c.text for c in output.outputs] if len(output.outputs) > 1 else output.outputs[0].text
+            for output in outputs
+        ]
+
+        # rag-stack monitor record: use vLLM's native token counts from
+        # RequestOutput when available — precise, no whitespace fallback.
+        if _t0 is not None:
+            vllm_input_tokens: List[int] = []
+            vllm_output_tokens: List[int] = []
+            try:
+                for ro in outputs:
+                    vllm_input_tokens.append(len(getattr(ro, "prompt_token_ids", []) or []))
+                    if ro.outputs:
+                        vllm_output_tokens.append(len(ro.outputs[0].token_ids or []))
+                    else:
+                        vllm_output_tokens.append(0)
+            except Exception:
+                vllm_input_tokens = []
+                vllm_output_tokens = []
+            record_kwargs = {"framework": "vllm"}
+            if (
+                len(vllm_input_tokens) == len(input_list)
+                and len(vllm_output_tokens) == len(generated_texts)
+            ):
+                record_kwargs["precise_input_tokens"] = vllm_input_tokens
+                record_kwargs["precise_output_tokens"] = vllm_output_tokens
+            # Pass generated_texts as outputs even when return_raw_output;
+            # the original return value is unchanged below.
+            outputs_for_record = [
+                t if isinstance(t, str) else (t[0] if t else "")
+                for t in generated_texts
+            ]
+            record_generate_call(
+                self, input_list, outputs_for_record,
+                (time.monotonic() - _t0) * 1000.0,
+                **record_kwargs,
+            )
+
         if return_raw_output:
             base_output = outputs
         else:
-            generated_texts = [
-                [c.text for c in output.outputs] if len(output.outputs) > 1 else output.outputs[0].text
-                for output in outputs
-            ]
             base_output = generated_texts
         if return_scores:
             scores = []
             for output in outputs:
+                output_scores = []
                 for single_output in output.outputs:
                     if single_output.logprobs:
-                        token_probs = [np.exp(list(score_dict.values())[0].logprob) 
+                        token_probs = [np.exp(list(score_dict.values())[0].logprob)
                                       for score_dict in single_output.logprobs]
                         output_scores.append(token_probs)
                     else:
@@ -364,6 +413,9 @@ class HFCausalLMGenerator(BaseGenerator):
         **params,
     ):
         """Generate batches one by one. The generated content needs to exclude input."""
+
+        # rag-stack monitor: time the whole batch + record after the work.
+        _t0 = time.monotonic() if get_monitor() is not None else None
 
         if isinstance(input_list, str):
             input_list = [input_list]
@@ -499,6 +551,12 @@ class HFCausalLMGenerator(BaseGenerator):
                     new_text = new_text[:lower_stop_index]
 
                 responses.append(new_text.strip())
+
+        if _t0 is not None:
+            record_generate_call(
+                self, input_list, responses, (time.monotonic() - _t0) * 1000.0,
+                framework="hf-causal",
+            )
 
         if return_dict:
             generated_token_ids = torch.cat(generated_token_ids, dim=0)

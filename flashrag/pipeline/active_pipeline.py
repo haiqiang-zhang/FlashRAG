@@ -4,6 +4,7 @@ from typing import List, Tuple
 import math
 import numpy as np
 from transformers import AutoTokenizer, PreTrainedTokenizer, PreTrainedTokenizerFast
+from flashrag.monitor_hook import query_context
 from flashrag.utils import get_retriever, get_generator, selfask_pred_parse, ircot_pred_parse
 from flashrag.pipeline import BasicPipeline
 from flashrag.dataset.utils import get_batch_dataset, merge_batch_dataset
@@ -753,15 +754,18 @@ class FLAREPipeline(BasicPipeline):
         gen_length = 0
         iter_round = 0
         final_gen_result = ""
+        # rag-stack monitor: FLARE is per-item (not batched); the context
+        # stays the same query across all calls in the inner loop, only
+        # step_idx advances per iter_round.
+        qid_list = [str(item.id)]
         while gen_length < self.max_generation_length and iter_round < self.max_iter_num:
             input_prompt = self.prompt_template.get_string(question=question, previous_gen=final_gen_result)
 
-            # input_prompt = self.build_prompt(
-            #     question_list=[question], use_reference=False, previous_gen=final_gen_result)[0]
             # scores: token logits of the whole generation seq
-            round_gen_output, scores = self.generator.generate(
-                input_prompt, return_scores=True, stop=self.stop_sym, max_new_tokens=self.look_ahead_steps
-            )
+            with query_context(qid_list, step_idx=iter_round):
+                round_gen_output, scores = self.generator.generate(
+                    input_prompt, return_scores=True, stop=self.stop_sym, max_new_tokens=self.look_ahead_steps
+                )
             round_gen_output, scores = round_gen_output[0], scores[0]
             # next_sent_scores: token logits of the first sent in generation seq
             next_sent, next_sent_score = self.get_next_sentence(round_gen_output, scores)
@@ -771,19 +775,17 @@ class FLAREPipeline(BasicPipeline):
 
             if not judge_result:
                 # do retrieval-augmented generation
-                retrieval_result = self.retriever.search(query)
+                with query_context(qid_list, step_idx=iter_round):
+                    retrieval_result = self.retriever.search(query)
                 item.update_output("retrieval_result", retrieval_result)
                 input_prompt = self.prompt_template.get_string(
                     question=question, retrieval_result=retrieval_result, previous_gen=final_gen_result
                 )
 
-                # input_prompt = self.build_prompt(
-                #     question_list = [question],
-                #     retrieval_results = [retrieval_result],
-                #     previous_gen = final_gen_result)[0]
-                output, scores = self.generator.generate(
-                    input_prompt, return_scores=True, stop=self.stop_sym, max_new_tokens=self.look_ahead_steps
-                )
+                with query_context(qid_list, step_idx=iter_round):
+                    output, scores = self.generator.generate(
+                        input_prompt, return_scores=True, stop=self.stop_sym, max_new_tokens=self.look_ahead_steps
+                    )
                 output, scores = output[0], scores[0]
                 next_sent, _ = self.get_next_sentence(output, scores)
                 item.update_output(f"gen_iter_{iter_round}", next_sent)
@@ -960,7 +962,9 @@ class IRCOTPipeline(BasicPipeline):
 
         # Initial retrieval for all items in the batch
         questions = [item.question for item in items]
-        retrieval_results, scoress = self.retriever.batch_search(questions, return_score=True)
+        # rag-stack monitor: step 0 = initial retrieval over the full batch.
+        with query_context([str(item.id) for item in items], step_idx=0):
+            retrieval_results, scoress = self.retriever.batch_search(questions, return_score=True)
         for retrieval_result, scores in zip(retrieval_results,scoress):   
             doc2score = {doc_item['id']: score for doc_item, score in zip(retrieval_result, scores)}
             id2doc = {doc_item['id']: doc_item for doc_item in retrieval_result}
@@ -982,19 +986,23 @@ class IRCOTPipeline(BasicPipeline):
             ]
             
 
-            # Batch generation for active items
-            new_thoughts_batch = self.generator.generate(input_prompts, stop=['.', '\n'])
-            
+            # rag-stack monitor: push attribution context for this batch.
+            with query_context(
+                [str(items[item_id].id) for item_id in active_item_ids],
+                step_idx=iter_num,
+            ):
+                new_thoughts_batch = self.generator.generate(input_prompts, stop=['.', '\n'])
+
             # Update thoughts and determine next active items
             new_active_item_ids = []
             for idx, item_id in enumerate(active_item_ids):
                 new_thought = new_thoughts_batch[idx]
                 batch_thoughts[item_id].append(new_thought)
-                
+
                 # Check for termination condition
                 # Store intermediate outputs
                 items[item_id].update_output(
-                        f'intermediate_output_iter{iter_num}', 
+                        f'intermediate_output_iter{iter_num}',
                         {
                             'input_prompt': input_prompts[idx],
                             'new_thought': new_thought,
@@ -1009,7 +1017,12 @@ class IRCOTPipeline(BasicPipeline):
             # Perform batch retrieval for new thoughts of active items
             if active_item_ids:
                 new_thoughts_for_retrieval = [batch_thoughts[item_id][-1] for item_id in active_item_ids]
-                new_retrieval_results, new_scoress = self.retriever.batch_search(new_thoughts_for_retrieval, return_score=True)
+                # rag-stack monitor: only the subset still active retrieves.
+                with query_context(
+                    [str(items[item_id].id) for item_id in active_item_ids],
+                    step_idx=iter_num,
+                ):
+                    new_retrieval_results, new_scoress = self.retriever.batch_search(new_thoughts_for_retrieval, return_score=True)
 
                 for i, item_id in enumerate(active_item_ids):
                     new_retrieval_result, new_scores = new_retrieval_results[i],new_scoress[i]

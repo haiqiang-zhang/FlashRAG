@@ -13,9 +13,51 @@ import copy
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from flashrag.utils import get_reranker, get_device
+from flashrag.monitor_hook import (
+    current_query_context,
+    get_monitor,
+    record_retrieve_call,
+)
 from flashrag.retriever.utils import load_corpus, load_docs, convert_numpy, judge_image, judge_zh
 from flashrag.retriever.encoder import Encoder, STEncoder, ClipEncoder
 import torch
+
+
+def _record_vectordb_batch(db_type: str, queries, idxs_per_query, latency_ms: float, extras=None):
+    """Helper for the inline vectordb monitor patches.
+
+    Reads the active query-id context from monitor_hook so attribution
+    matches the outer pipeline patch. Falls back to placeholder IDs when
+    the context isn't set (e.g. direct retriever usage outside a pipeline).
+    """
+    mon = get_monitor()
+    if mon is None:
+        return
+    ctx = current_query_context()
+    if ctx is not None:
+        qids = ctx[0][: len(queries)]
+        step = ctx[1]
+    else:
+        qids = [f"__unattributed_{i}__" for i in range(len(queries))]
+        step = 0
+    # Each query gets a list of doc-ids retrieved by the index. The
+    # vectordb event captures only the raw lookup — no token info, since
+    # FAISS doesn't see text.
+    doc_ids_per_query = []
+    for ids in idxs_per_query:
+        try:
+            doc_ids_per_query.append([str(i) for i in ids])
+        except Exception:
+            doc_ids_per_query.append([])
+    mon.record_vectordb_call(
+        query_ids=qids,
+        step_idx=step,
+        db_type=db_type,
+        queries=list(queries),
+        doc_ids_per_query=doc_ids_per_query,
+        latency_ms=float(latency_ms),
+        extras=dict(extras or {}),
+    )
 
 if get_device() == "cpu":
     faiss.omp_set_num_threads(1)
@@ -115,6 +157,49 @@ def rerank_manager(func):
     return wrapper
 
 
+def monitor_retrieve(func):
+    """rag-stack outermost decorator: time + record the composite retrieve.
+
+    Captures the **complete** retriever call (cache + encode + raw lookup +
+    optional rerank) as one ``retrieve`` event. The inner ``vectordb`` event
+    is recorded separately by :class:`DenseRetriever._batch_search` /
+    :class:`BM25Retriever._batch_search`, and the ``rerank`` event is
+    recorded by :class:`BaseReranker.rerank`. All three live alongside in
+    the per-query DAG.
+    """
+
+    @functools.wraps(func)
+    def wrapper(self, query, num=None, return_score=False):
+        mon = get_monitor()
+        if mon is None:
+            return func(self, query, num=num, return_score=return_score)
+
+        t0 = time.monotonic()
+        result = func(self, query, num=num, return_score=return_score)
+        latency_ms = (time.monotonic() - t0) * 1000.0
+
+        # Disentangle docs from (docs, scores) tuple if the caller asked for scores.
+        if return_score and isinstance(result, tuple) and len(result) == 2:
+            doc_lists = result[0]
+        else:
+            doc_lists = result
+
+        # Normalize to "list of per-query doc-lists" for the recorder. Both
+        # single-query and batch paths land here; we just wrap singles.
+        is_batch = "batch" in func.__name__
+        if is_batch:
+            queries_list = [query] if isinstance(query, str) else list(query)
+            doc_lists_batch = list(doc_lists or [])
+        else:
+            queries_list = [query if isinstance(query, str) else (query[0] if query else "")]
+            doc_lists_batch = [list(doc_lists or [])]
+
+        record_retrieve_call(self, queries_list, doc_lists_batch, latency_ms)
+        return result
+
+    return wrapper
+
+
 class BaseRetriever:
     """Base object for all retrievers."""
 
@@ -204,11 +289,13 @@ class BaseTextRetriever(BaseRetriever):
     def __init__(self, config):
         super().__init__(config)
 
+    @monitor_retrieve  # rag-stack: outermost — records composite retrieve event
     @cache_manager
     @rerank_manager
     def search(self, *args, **kwargs):
         return self._search(*args, **kwargs)
 
+    @monitor_retrieve  # rag-stack: outermost — records composite retrieve event
     @cache_manager
     @rerank_manager
     def batch_search(self, *args, **kwargs):
@@ -325,6 +412,9 @@ class BM25Retriever(BaseTextRetriever):
             return results
 
     def _batch_search(self, query, num: int = None, return_score=False):
+        # rag-stack monitor hook: time the raw BM25 search so the cost
+        # model can compare against dense FAISS lookup at the same layer.
+        _t0 = time.monotonic()
         if self.backend == "pyserini":
             # TODO: modify batch method
             results = []
@@ -341,8 +431,27 @@ class BM25Retriever(BaseTextRetriever):
             results, scores = self.searcher.retrieve(query_tokens, k=num)
         else:
             assert False, "Invalid bm25 backend!"
+        _vdb_lat_ms = (time.monotonic() - _t0) * 1000.0
         results = results.tolist() if isinstance(results, np.ndarray) else results
         scores = scores.tolist() if isinstance(scores, np.ndarray) else scores
+        # Best-effort doc-id extraction for the monitor event. BM25 results
+        # are typically lists of dicts (pyserini) or doc indices (bm25s);
+        # the recorder will gracefully degrade to empty lists if it can't
+        # coerce them — what matters most is the latency.
+        try:
+            idxs_per_query = [
+                [d.get("id") if isinstance(d, dict) else d for d in (docs or [])]
+                for docs in results
+            ]
+        except Exception:
+            idxs_per_query = [[] for _ in query]
+        _record_vectordb_batch(
+            db_type=f"bm25:{self.backend}",
+            queries=query if isinstance(query, list) else [query],
+            idxs_per_query=idxs_per_query,
+            latency_ms=_vdb_lat_ms,
+            extras={"k": num},
+        )
         if return_score:
             return results, scores
         else:
@@ -369,6 +478,17 @@ class DenseRetriever(BaseTextRetriever):
         if self.index_path is None or not os.path.exists(self.index_path):
             raise Warning(f"Index file {self.index_path} does not exist!")
         self.index = faiss.read_index(self.index_path)
+        # rag-stack fork: expose IVF / HNSW search-time params to the config.
+        # ``nprobe`` (IVF) defaults to 1, which yields awful recall; ``efSearch``
+        # (HNSW) defaults to whatever the index was built with. Both are FAISS
+        # standard attributes — applying them is a no-op for ``Flat`` indexes
+        # (the ``hasattr`` guards keep behavior unchanged for non-rag-stack users).
+        nprobe = self._config.get("nprobe") if hasattr(self._config, "get") else None
+        ef_search = self._config.get("ef_search") if hasattr(self._config, "get") else None
+        if nprobe is not None and hasattr(self.index, "nprobe"):
+            self.index.nprobe = int(nprobe)
+        if ef_search is not None and hasattr(self.index, "hnsw"):
+            self.index.hnsw.efSearch = int(ef_search)
         if self.use_faiss_gpu:
             co = faiss.GpuMultipleClonerOptions()
             co.useFloat16 = True
@@ -457,9 +577,21 @@ class DenseRetriever(BaseTextRetriever):
         results = []
         scores = []
         emb = self.encoder.encode(query, batch_size=batch_size, is_query=True)
+        # rag-stack monitor hook: time only the raw FAISS index.search call
+        # so the cost model can separate encoder time from vectordb time.
+        _t0 = time.monotonic()
         scores, idxs = self.index.search(emb, k=num)
+        _vdb_lat_ms = (time.monotonic() - _t0) * 1000.0
         scores = scores.tolist()
         idxs = idxs.tolist()
+
+        _record_vectordb_batch(
+            db_type=f"faiss:{getattr(self, 'retrieval_method', 'dense')}",
+            queries=query,
+            idxs_per_query=idxs,
+            latency_ms=_vdb_lat_ms,
+            extras={"k": num, "use_faiss_gpu": getattr(self, "use_faiss_gpu", False)},
+        )
 
         flat_idxs = [idx for sublist in idxs for idx in sublist]
         results = load_docs(self.corpus, flat_idxs)

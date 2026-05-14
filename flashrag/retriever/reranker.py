@@ -1,9 +1,16 @@
+import time
 from typing import List
 import torch
 import warnings
 import numpy as np
 from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from flashrag.monitor_hook import (
+    count_doc_tokens,
+    count_tokens,
+    current_query_context,
+    get_monitor,
+)
 from flashrag.retriever.encoder import Encoder
 
 
@@ -34,6 +41,11 @@ class BaseReranker:
     @torch.inference_mode(mode=True)
     def rerank(self, query_list, doc_list, batch_size=None, topk=None):
         r"""Rerank doc_list."""
+        # rag-stack monitor hook: time the whole rerank call so the cost
+        # model can separate reranker cost from raw retriever cost.
+        _mon = get_monitor()
+        _t0 = time.monotonic() if _mon is not None else None
+
         if batch_size is None:
             batch_size = self.batch_size
         if topk is None:
@@ -71,6 +83,30 @@ class BaseReranker:
             final_docs.append([docs[idx] for idx in sort_idxs])
             final_scores.append([doc_scores[idx] for idx in sort_idxs])
 
+        # rag-stack monitor hook: emit per-query rerank events.
+        if _mon is not None:
+            _lat = (time.monotonic() - _t0) * 1000.0
+            _ctx = current_query_context()
+            _qids: List = (
+                _ctx[0][: len(query_list)] if _ctx is not None
+                else [f"__unattributed_{i}__" for i in range(len(query_list))]
+            )
+            _step = _ctx[1] if _ctx is not None else 0
+            _tok = getattr(self, "tokenizer", None)
+            for qid, q, docs_in, docs_out in zip(
+                _qids, query_list, doc_list, final_docs,
+            ):
+                _mon.record_rerank_call(
+                    query_id=qid,
+                    step_idx=_step,
+                    model_id=getattr(self, "reranker_model_name", None),
+                    query=q,
+                    docs_in=list(docs_in),
+                    docs_out=list(docs_out),
+                    input_tokens=count_tokens(q, _tok) + count_doc_tokens(docs_in, _tok),
+                    output_tokens=count_doc_tokens(docs_out, _tok),
+                    latency_ms=_lat / max(len(query_list), 1),
+                )
         return final_docs, final_scores
 
 
