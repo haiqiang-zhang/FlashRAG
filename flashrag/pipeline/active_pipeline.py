@@ -25,6 +25,8 @@ class IterativePipeline(BasicPipeline):
 
     def run(self, dataset, do_eval=True, pred_process_fun=None):
         questions = dataset.question
+        # rag-stack monitor: every Iter-RetGen round touches the full batch.
+        qid_list = [str(item.id) for item in dataset]
         # run in batch
         past_generation_result = []  # list of N items
         for iter_idx in range(self.iter_num):
@@ -35,7 +37,8 @@ class IterativePipeline(BasicPipeline):
                 input_query = [f"{q} {r}" for q, r in zip(questions, past_generation_result)]
 
             # generation-augmented retrieval
-            retrieval_results = self.retriever.batch_search(input_query)
+            with query_context(qid_list, step_idx=iter_idx):
+                retrieval_results = self.retriever.batch_search(input_query)
             dataset.update_output(f"retrieval_result_iter_{iter_idx}", retrieval_results)
 
             # retrieval-augmented generation
@@ -46,7 +49,8 @@ class IterativePipeline(BasicPipeline):
             ]
 
             dataset.update_output(f"prompt_iter_{iter_idx}", input_prompts)
-            past_generation_result = self.generator.generate(input_prompts)
+            with query_context(qid_list, step_idx=iter_idx):
+                past_generation_result = self.generator.generate(input_prompts)
             dataset.update_output(f"pred_iter_{iter_idx}", past_generation_result)
 
         # use last retrieval result for evaluation

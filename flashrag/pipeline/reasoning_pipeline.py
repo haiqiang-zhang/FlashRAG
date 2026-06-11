@@ -84,6 +84,14 @@ class ReasoningPipeline(BasicPipeline):
         format_doc_string = f'\n\n{self.begin_of_documents_token}\n{format_doc_string}\n{self.end_of_documents_token}\n\n'
         return format_doc_string
 
+    def _build_doc_strings(self, step_query_list, retrieved_docs, current_step_idx):
+        """Prompt insertions for this round's retrievals, one per query.
+
+        Default: plain per-item formatting. Subclasses may override to
+        post-process docs (e.g. Search-o1's Reason-in-Documents distillation).
+        """
+        return [self._retrieved_docs_to_string(docs) for docs in retrieved_docs]
+
     def run(self, dataset, do_eval=True, pred_process_fun=None):
         prompts = [self.prompt_template.get_string(question=question) for question in dataset.question]
         dataset.update_output('prompt', prompts)
@@ -144,12 +152,19 @@ class ReasoningPipeline(BasicPipeline):
                     step_idx=current_step_idx,
                 ):
                     retrieved_docs = self.retriever.batch_search([it['query'] for it in step_query_list])
-                for it, item_retrieved_docs in zip(step_query_list, retrieved_docs):
+                # Overridable hook: subclasses may transform the raw docs
+                # before insertion (e.g. Search-o1's Reason-in-Documents
+                # refinement runs an extra batched generator pass here).
+                doc_strings = self._build_doc_strings(
+                    step_query_list, retrieved_docs, current_step_idx
+                )
+                for it, item_retrieved_docs, format_doc_string in zip(
+                    step_query_list, retrieved_docs, doc_strings
+                ):
                     item = it['item']
                     query = it['query']
                     item.retrieval_results[item.retrieved_times] = {'query': query,'docs': copy.copy(item_retrieved_docs)}
                     #item.retrieved_docs += [item_retrieved_docs]
-                    format_doc_string = self._retrieved_docs_to_string(item_retrieved_docs)
                     item.prompt += format_doc_string
                     item.retrieved_times += 1
 
