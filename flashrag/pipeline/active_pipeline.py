@@ -850,7 +850,11 @@ class SelfAskPipeline(BasicPipeline):
 
     def run_item(self, item):
         question = item.question
-        retrieval_result = self.retriever.search(question)
+        # rag-stack monitor: Self-Ask is per-item (like FLARE) — the same query
+        # spans every call in the inner loop, only step_idx advances per round.
+        qid_list = [str(item.id)]
+        with query_context(qid_list, step_idx=0):
+            retrieval_result = self.retriever.search(question)
 
         stop_condition = "Intermediate answer:"
         follow_ups = "No." if self.single_hop else "Yes."
@@ -867,7 +871,8 @@ class SelfAskPipeline(BasicPipeline):
                 + "\n"
                 + res
             )
-            gen_out = self.generator.generate(input_prompt, stop=["Context:", "#", stop_condition])[0]
+            with query_context(qid_list, step_idx=idx):
+                gen_out = self.generator.generate(input_prompt, stop=["Context:", "#", stop_condition])[0]
             item.update_output(f"intermediate_output_iter{idx}", gen_out)
 
             if stop_condition == "Intermediate answer:":
@@ -892,7 +897,8 @@ class SelfAskPipeline(BasicPipeline):
             if "Follow up: " in gen_out:
                 # get the first follow up
                 new_query = [l for l in gen_out.split("\n") if "Follow up: " in l][0].split("Follow up: ")[-1]
-                retrieval_result = self.retriever.search(new_query)
+                with query_context(qid_list, step_idx=idx):
+                    retrieval_result = self.retriever.search(new_query)
 
             if "So the final answer is: " in gen_out:
                 res = (
